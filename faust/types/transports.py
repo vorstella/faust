@@ -25,6 +25,7 @@ from typing import (
 )
 
 from mode import Seconds, ServiceT
+from mode.utils.collections import FastUserDict
 from yarl import URL
 
 from .channels import ChannelT
@@ -44,6 +45,8 @@ __all__ = [
     'ConsumerT',
     'ProducerT',
     'ConductorT',
+    'TransactionManagerT',
+    'TransactionProducerT',
     'TransportT',
 ]
 
@@ -70,10 +73,119 @@ PartitionerT = Callable[
 ]
 
 
+class ProducerT(ServiceT):
+
+    #: The transport that created this Producer.
+    transport: 'TransportT'
+
+    client_id: str
+    linger_ms: int
+    max_batch_size: int
+    acks: int
+    max_request_size: int
+    compression_type: Optional[str]
+    ssl_context: Optional[ssl.SSLContext]
+    partitioner: Optional[PartitionerT]
+    request_timeout: float
+
+    @abc.abstractmethod
+    def __init__(self, transport: 'TransportT',
+                 loop: asyncio.AbstractEventLoop = None,
+                 **kwargs: Any) -> None:
+        ...
+
+    @abc.abstractmethod
+    async def send(self, topic: str, key: Optional[bytes],
+                   value: Optional[bytes],
+                   partition: Optional[int]) -> Awaitable[RecordMetadata]:
+        ...
+
+    @abc.abstractmethod
+    async def send_and_wait(self, topic: str, key: Optional[bytes],
+                            value: Optional[bytes],
+                            partition: Optional[int]) -> RecordMetadata:
+        ...
+
+    @abc.abstractmethod
+    async def create_topic(self,
+                           topic: str,
+                           partitions: int,
+                           replication: int,
+                           *,
+                           config: Mapping[str, Any] = None,
+                           timeout: Seconds = 1000.0,
+                           retention: Seconds = None,
+                           compacting: bool = None,
+                           deleting: bool = None,
+                           ensure_created: bool = False) -> None:
+        ...
+
+    @abc.abstractmethod
+    def key_partition(self, topic: str, key: bytes) -> TP:
+        ...
+
+    @abc.abstractmethod
+    async def flush(self) -> None:
+        ...
+
+
+class TransactionProducerT(ProducerT):
+
+    partition: int
+
+    @abc.abstractmethod
+    def __init__(self, transport: 'TransportT',
+                 loop: asyncio.AbstractEventLoop = None,
+                 *,
+                 partition: int,
+                 **kwargs: Any) -> None:
+        ...
+
+    @abc.abstractmethod
+    async def commit(self, offsets: Mapping[TP, int], group_id: str) -> None:
+        ...
+
+    @property
+    @abc.abstractmethod
+    def transaction_id(self) -> str:
+        ...
+
+
+class TransactionManagerT(ServiceT, FastUserDict[int, TransactionProducerT]):
+    consumer: 'ConsumerT'
+
+    @abc.abstractmethod
+    def __init__(self, consumer: 'ConsumerT', **kwargs: Any) -> None:
+        ...
+
+    @abc.abstractmethod
+    async def on_partitions_revoked(self, revoked: Set[TP]) -> None:
+        ...
+
+    @abc.abstractmethod
+    async def on_rebalance(self,
+                           assigned: Set[TP],
+                           revoked: Set[TP],
+                           newly_assigned: Set[TP]) -> None:
+        ...
+
+    @abc.abstractmethod
+    async def send(self, topic: str, key: Optional[bytes],
+                   value: Optional[bytes],
+                   partition: Optional[int]) -> Awaitable[RecordMetadata]:
+        ...
+
+    @abc.abstractmethod
+    async def commit(self, offsets: Mapping[TP, int]) -> None:
+        ...
+
+
 class ConsumerT(ServiceT):
 
     #: The transport that created this Consumer.
     transport: 'TransportT'
+
+    transactions: TransactionManagerT
 
     #: How often we commit topic offsets.
     #: See :setting:`broker_commit_interval`.
@@ -195,68 +307,19 @@ class ConsumerT(ServiceT):
         ...
 
     @abc.abstractmethod
+    def key_partition(self,
+                      topic: str,
+                      key: Optional[bytes],
+                      partition: int = None) -> int:
+        ...
+
+    @abc.abstractmethod
     def close(self) -> None:
         ...
 
     @property
     @abc.abstractmethod
     def unacked(self) -> Set[Message]:
-        ...
-
-
-class ProducerT(ServiceT):
-
-    #: The transport that created this Producer.
-    transport: 'TransportT'
-
-    client_id: str
-    linger_ms: int
-    max_batch_size: int
-    acks: int
-    max_request_size: int
-    compression_type: Optional[str]
-    ssl_context: Optional[ssl.SSLContext]
-    partitioner: Optional[PartitionerT]
-    request_timeout: float
-
-    @abc.abstractmethod
-    def __init__(self, transport: 'TransportT',
-                 loop: asyncio.AbstractEventLoop = None,
-                 **kwargs: Any) -> None:
-        ...
-
-    @abc.abstractmethod
-    async def send(self, topic: str, key: Optional[bytes],
-                   value: Optional[bytes],
-                   partition: Optional[int]) -> Awaitable[RecordMetadata]:
-        ...
-
-    @abc.abstractmethod
-    async def send_and_wait(self, topic: str, key: Optional[bytes],
-                            value: Optional[bytes],
-                            partition: Optional[int]) -> RecordMetadata:
-        ...
-
-    @abc.abstractmethod
-    async def create_topic(self,
-                           topic: str,
-                           partitions: int,
-                           replication: int,
-                           *,
-                           config: Mapping[str, Any] = None,
-                           timeout: Seconds = 1000.0,
-                           retention: Seconds = None,
-                           compacting: bool = None,
-                           deleting: bool = None,
-                           ensure_created: bool = False) -> None:
-        ...
-
-    @abc.abstractmethod
-    def key_partition(self, topic: str, key: bytes) -> TP:
-        ...
-
-    @abc.abstractmethod
-    async def flush(self) -> None:
         ...
 
 
@@ -296,6 +359,12 @@ class TransportT(abc.ABC):
     #: The Producer class used for this type of transport.
     Producer: ClassVar[Type[ProducerT]]
 
+    #: The TransactionProducer class used for transactions.
+    TransactionProducer: ClassVar[Type[TransactionProducerT]]
+
+    #: The TransactionManager class used for managing multiple transactions.
+    TransactionManager: ClassVar[Type[TransactionManagerT]]
+
     #: The Conductor class used to delegate messages from Consumer to streams.
     Conductor: ClassVar[Type[ConductorT]]
 
@@ -328,6 +397,18 @@ class TransportT(abc.ABC):
 
     @abc.abstractmethod
     def create_producer(self, **kwargs: Any) -> ProducerT:
+        ...
+
+    @abc.abstractmethod
+    def create_transaction_producer(self,
+                                    partition: int,
+                                    **kwargs: Any) -> TransactionProducerT:
+        ...
+
+    @abc.abstractmethod
+    def create_transaction_manager(self,
+                                   consumer: ConsumerT,
+                                   **kwargs: Any) -> TransactionManagerT:
         ...
 
     @abc.abstractmethod

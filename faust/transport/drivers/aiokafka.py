@@ -48,7 +48,13 @@ from faust.transport.consumer import (
     ensure_TPset,
 )
 from faust.types import ConsumerMessage, RecordMetadata, TP
-from faust.types.transports import ConsumerT, ProducerT
+from faust.types.enums import ProcessingGuarantee
+from faust.types.transports import (
+    ConsumerT,
+    PartitionerT,
+    ProducerT,
+    TransactionProducerT,
+)
 from faust.utils.kafka.protocol.admin import CreateTopicsRequest
 
 __all__ = ['Consumer', 'Producer', 'Transport']
@@ -149,6 +155,8 @@ class AIOKafkaConsumerThread(ConsumerThread):
     _consumer: Optional[aiokafka.AIOKafkaConsumer] = None
 
     def on_init(self) -> None:
+        self._partitioner: PartitionerT = (
+            self.app.conf.producer_partitioner or DefaultPartitioner())
         self._rebalance_listener = self.consumer.RebalanceListener(self)
 
     async def on_start(self) -> None:
@@ -342,6 +350,22 @@ class AIOKafkaConsumerThread(ConsumerThread):
             ensure_created=ensure_created,
         )
 
+    def key_partition(self,
+                      topic: str,
+                      key: Optional[bytes],
+                      partition: int = None) -> int:
+        consumer = self._ensure_consumer()
+        metadata = consumer._client.cluster
+        if partition is not None:
+            assert partition >= 0
+            assert partition in metadata.partitions_for_topic(topic), \
+                'Unrecognized partition'
+            return partition
+
+        all_partitions = list(metadata.partitions_for_topic(topic))
+        available = list(metadata.available_partitions_for_topic(topic))
+        return self._partitioner(key, all_partitions, available)
+
 
 class Producer(base.Producer):
     """Kafka producer using :pypi:`aiokafka`."""
@@ -351,22 +375,46 @@ class Producer(base.Producer):
     _producer: aiokafka.AIOKafkaProducer
 
     def on_init(self) -> None:
+        self._processing_settings = {
+            ProcessingGuarantee.AT_LEAST_ONCE: self._settings_at_least_once,
+            ProcessingGuarantee.EXACTLY_ONCE: self._settings.exactly_once,
+        }
+        self._producer = self._new_producer()
+
+    def _settings_default(self) -> Mapping[str, Any]:
         transport = cast(Transport, self.transport)
-        self._producer = aiokafka.AIOKafkaProducer(
-            loop=self.loop,
-            bootstrap_servers=server_list(
+        return {
+            'bootstrap_servers': server_list(
                 transport.url, transport.default_port),
-            client_id=self.client_id,
-            acks=self.acks,
-            linger_ms=self.linger_ms,
-            max_batch_size=self.max_batch_size,
-            max_request_size=self.max_request_size,
-            compression_type=self.compression_type,
-            on_irrecoverable_error=self._on_irrecoverable_error,
-            security_protocol='SSL' if self.ssl_context else 'PLAINTEXT',
-            ssl_context=self.ssl_context,
-            partitioner=self.partitioner or DefaultPartitioner(),
-            request_timeout_ms=int(self.request_timeout * 1000),
+            'client_id': self.client_id,
+            'acks': self.acks,
+            'linger_ms': self.linger_ms,
+            'max_batch_size': self.max_batch_size,
+            'max_request_size': self.max_request_size,
+            'compression_type': self.compression_type,
+            'on_irrecoverable_error': self._on_irrecoverable_error,
+            'security_protocol': 'SSL' if self.ssl_context else 'PLAINTEXT',
+            'ssl_context': self.ssl_context,
+            'partitioner': self.partitioner or DefaultPartitioner(),
+            'request_timeout_ms': int(self.request_timeout * 1000),
+        }
+
+    def _settings_at_least_once(self) -> Mapping[str, Any]:
+        return {}
+
+    def _settings_exactly_once(self) -> Mapping[str, Any]:
+        return {
+            'enable_idempotence': True,
+            'acks': 'all',
+            'transactional_id': self.transport.app.consumer.transactional_id,
+        }
+
+    def _new_producer(self) -> aiokafka.AIOKafkaProducer:
+        processing_guarantee = self.transport.app.conf.processing_guarantee
+        return aiokafka.AIOKafkaProducer(
+            loop=self.loop,
+            **{**self._settings_default(),
+               **self._processing_settings[processing_guarantee]()},
         )
 
     async def _on_irrecoverable_error(self, exc: BaseException) -> None:
@@ -445,11 +493,21 @@ class Producer(base.Producer):
         return TP(topic, partition)
 
 
+class TransactionProducer(Producer, base.TransactionProducer):
+
+    async def commit(self, offsets: Mapping[TP, int], group_id: str) -> None:
+        await self._producer.send_offsets_to_transaction(offsets, group_id)
+
+
 class Transport(base.Transport):
     """Kafka transport using :pypi:`aiokafka`."""
 
-    Consumer: ClassVar[Type[ConsumerT]] = Consumer
-    Producer: ClassVar[Type[ProducerT]] = Producer
+    Consumer: ClassVar[Type[ConsumerT]]
+    Consumer = Consumer
+    Producer: ClassVar[Type[ProducerT]]
+    Producer = Producer
+    TransactionProducer: ClassVar[Type[TransactionProducerT]]
+    TransactionProducer = TransactionProducer
 
     default_port = 9092
     driver_version = f'aiokafka={aiokafka.__version__}'

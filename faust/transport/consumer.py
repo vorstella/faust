@@ -52,6 +52,7 @@ from time import monotonic
 from typing import (
     Any,
     AsyncIterator,
+    Awaitable,
     ClassVar,
     Dict,
     Iterable,
@@ -74,13 +75,15 @@ from mode.utils.futures import notify
 from mode.utils.locks import Event
 from mode.utils.times import Seconds
 from faust.exceptions import ProducerSendError
-from faust.types import AppT, ConsumerMessage, Message, TP
+from faust.types import AppT, ConsumerMessage, Message, RecordMetadata, TP
 from faust.types.transports import (
     ConsumerCallback,
     ConsumerT,
     PartitionsAssignedCallback,
     PartitionsRevokedCallback,
     TPorTopicSet,
+    TransactionManagerT,
+    TransactionProducerT,
     TransportT,
 )
 from faust.utils import terminal
@@ -156,6 +159,67 @@ class Fetcher(Service):
             pass
         finally:
             self.set_shutdown()
+
+
+class TransactionManager(Service, TransactionManagerT):
+
+    def __init__(self, consumer: 'ConsumerT', **kwargs: Any) -> None:
+        self.consumer = consumer
+        self.data: MutableMapping[int, TransactionProducerT] = {}
+        super().__init__(**kwargs)
+
+    async def on_stop(self) -> None:
+        await asyncio.gather(*[producer.stop() for producer in self.values()])
+
+    async def on_partitions_revoked(self, revoked: Set[TP]) -> None:
+        # flush all producers
+        await asyncio.gather(*[producer.flush() for producer in self.values()])
+
+    async def on_rebalance(self,
+                           assigned: Set[TP],
+                           revoked: Set[TP],
+                           newly_assigned: Set[TP]) -> None:
+        transport = self.consumer.transport
+        revoked_partitions: Set[int] = {tp.partition for tp in revoked}
+        assigned_partitions: Set[int] = {tp.partition for tp in newly_assigned}
+
+        # Stop producers for revoked partitions.
+        producers_to_stop: List[TransactionProducerT] = []
+        for revoked_partition in revoked_partitions:
+            producer = self.pop(revoked_partition, None)
+            producers_to_stop.append(producer)
+        await asyncio.gather(*[
+            producer.stop() for producer in producers_to_stop
+        ])
+
+        # Start producers for newly assigned partitions.
+        for assigned_partition in assigned_partitions:
+            assert assigned_partition not in self
+            self[assigned_partition] = transport.create_transaction_producer(
+                assigned_partition, beacon=self.beacon, loop=self.loop)
+            await self[assigned_partition].start()
+
+    async def send(self, topic: str, key: Optional[bytes],
+                   value: Optional[bytes],
+                   partition: Optional[int]) -> Awaitable[RecordMetadata]:
+        p: int = self.consumer.key_partition(topic, key, partition)
+        return await self[p].send(topic, key, value, p)
+
+    async def commit(self, offsets: Mapping[TP, int]) -> None:
+        group_id = self.consumer.group_id
+        group_by_partitions: MutableMapping[int, MutableMapping[TP, int]]
+        group_by_partitions = defaultdict(dict)
+
+        for tp, offset in offsets.items():
+            group_by_partitions[tp.partition][tp] = offset
+
+        await asyncio.gather(*[
+            self[partition].commit(partition_offsets, group_id)
+            for partition, partition_offsets in group_by_partitions.items()
+        ])
+
+    def key_partition(self, topic: str, key: bytes) -> TP:
+        raise NotImplementedError()
 
 
 class Consumer(Service, ConsumerT):
@@ -252,6 +316,8 @@ class Consumer(Service, ConsumerT):
         self.can_resume_flow = Event()
         self._reset_state()
         super().__init__(loop=loop or self.transport.loop, **kwargs)
+        self.transactions = self.transport.create_transaction_manager(
+            self, beacon=self.beacon, loop=self.loop)
 
     def _reset_state(self) -> None:
         self._active_partitions = None
@@ -877,6 +943,13 @@ class ConsumerThread(QueueServiceThread):
         await self.consumer.threadsafe_partitions_assigned(
             self.thread_loop, assigned)
 
+    @abc.abstractmethod
+    def key_partition(self,
+                      topic: str,
+                      key: Optional[bytes],
+                      partition: int = None) -> int:
+        ...
+
 
 class ThreadDelegateConsumer(Consumer):
 
@@ -966,3 +1039,9 @@ class ThreadDelegateConsumer(Consumer):
 
     def close(self) -> None:
         self._thread.close()
+
+    def key_partition(self,
+                      topic: str,
+                      key: Optional[bytes],
+                      partition: int = None) -> int:
+        return self._thread.key_partition(topic, key, partition=partition)
