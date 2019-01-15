@@ -162,23 +162,29 @@ class Fetcher(Service):
 
 
 class TransactionManager(Service, TransactionManagerT):
+    _producers: MutableMapping[int, TransactionProducerT]
 
     def __init__(self, consumer: 'ConsumerT', **kwargs: Any) -> None:
         self.consumer = consumer
-        self.data: MutableMapping[int, TransactionProducerT] = {}
+        self._producers = {}
         super().__init__(**kwargs)
 
     async def on_stop(self) -> None:
-        await asyncio.gather(*[producer.stop() for producer in self.values()])
+        await asyncio.gather(*[
+            producer.stop() for producer in self._producers_values()
+        ])
 
     async def on_partitions_revoked(self, revoked: Set[TP]) -> None:
         # flush all producers
-        await asyncio.gather(*[producer.flush() for producer in self.values()])
+        await asyncio.gather(*[
+            producer.flush() for producer in self._producers.values()
+        ])
 
     async def on_rebalance(self,
                            assigned: Set[TP],
                            revoked: Set[TP],
                            newly_assigned: Set[TP]) -> None:
+        producers = self._producers
         transport = self.consumer.transport
         revoked_partitions: Set[int] = {tp.partition for tp in revoked}
         assigned_partitions: Set[int] = {tp.partition for tp in newly_assigned}
@@ -186,26 +192,28 @@ class TransactionManager(Service, TransactionManagerT):
         # Stop producers for revoked partitions.
         producers_to_stop: List[TransactionProducerT] = []
         for revoked_partition in revoked_partitions:
-            producer = self.pop(revoked_partition, None)
-            producers_to_stop.append(producer)
+            producer = producers.pop(revoked_partition, None)
+            if producer is not None:
+                producers_to_stop.append(producer)
         await asyncio.gather(*[
             producer.stop() for producer in producers_to_stop
         ])
 
         # Start producers for newly assigned partitions.
-        for assigned_partition in assigned_partitions:
-            assert assigned_partition not in self
-            self[assigned_partition] = transport.create_transaction_producer(
-                assigned_partition, beacon=self.beacon, loop=self.loop)
-            await self[assigned_partition].start()
+        for partition in assigned_partitions:
+            assert partition not in producers
+            pr = producers[partition] = transport.create_transaction_producer(
+                partition, beacon=self.beacon, loop=self.loop)
+            await pr.start()
 
     async def send(self, topic: str, key: Optional[bytes],
                    value: Optional[bytes],
                    partition: Optional[int]) -> Awaitable[RecordMetadata]:
         p: int = self.consumer.key_partition(topic, key, partition)
-        return await self[p].send(topic, key, value, p)
+        return await self._producers[p].send(topic, key, value, p)
 
     async def commit(self, offsets: Mapping[TP, int]) -> None:
+        producers = self._producers
         group_id = self.consumer.group_id
         group_by_partitions: MutableMapping[int, MutableMapping[TP, int]]
         group_by_partitions = defaultdict(dict)
@@ -214,7 +222,7 @@ class TransactionManager(Service, TransactionManagerT):
             group_by_partitions[tp.partition][tp] = offset
 
         await asyncio.gather(*[
-            self[partition].commit(partition_offsets, group_id)
+            producers[partition].commit(partition_offsets, group_id)
             for partition, partition_offsets in group_by_partitions.items()
         ])
 

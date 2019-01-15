@@ -25,7 +25,6 @@ from typing import (
 )
 
 from mode import Seconds, ServiceT
-from mode.utils.collections import FastUserDict
 from yarl import URL
 
 from .channels import ChannelT
@@ -151,7 +150,7 @@ class TransactionProducerT(ProducerT):
         ...
 
 
-class TransactionManagerT(ServiceT, FastUserDict[int, TransactionProducerT]):
+class TransactionManagerT(ServiceT):
     consumer: 'ConsumerT'
 
     @abc.abstractmethod
