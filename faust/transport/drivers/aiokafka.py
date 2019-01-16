@@ -48,7 +48,6 @@ from faust.transport.consumer import (
     ensure_TPset,
 )
 from faust.types import ConsumerMessage, RecordMetadata, TP
-from faust.types.enums import ProcessingGuarantee
 from faust.types.transports import (
     ConsumerT,
     PartitionerT,
@@ -375,10 +374,6 @@ class Producer(base.Producer):
     _producer: aiokafka.AIOKafkaProducer
 
     def on_init(self) -> None:
-        self._processing_settings = {
-            ProcessingGuarantee.AT_LEAST_ONCE: self._settings_at_least_once,
-            ProcessingGuarantee.EXACTLY_ONCE: self._settings.exactly_once,
-        }
         self._producer = self._new_producer()
 
     def _settings_default(self) -> Mapping[str, Any]:
@@ -399,22 +394,14 @@ class Producer(base.Producer):
             'request_timeout_ms': int(self.request_timeout * 1000),
         }
 
-    def _settings_at_least_once(self) -> Mapping[str, Any]:
+    def _settings_extra(self) -> Mapping[str, Any]:
         return {}
 
-    def _settings_exactly_once(self) -> Mapping[str, Any]:
-        return {
-            'enable_idempotence': True,
-            'acks': 'all',
-            'transactional_id': self.transport.app.consumer.transactional_id,
-        }
-
     def _new_producer(self) -> aiokafka.AIOKafkaProducer:
-        processing_guarantee = self.transport.app.conf.processing_guarantee
         return aiokafka.AIOKafkaProducer(
             loop=self.loop,
             **{**self._settings_default(),
-               **self._processing_settings[processing_guarantee]()},
+               **self._settings_extra()},
         )
 
     async def _on_irrecoverable_error(self, exc: BaseException) -> None:
@@ -495,8 +482,24 @@ class Producer(base.Producer):
 
 class TransactionProducer(Producer, base.TransactionProducer):
 
+    async def on_start(self) -> None:
+        await super().on_start()
+        await self._producer.start_transaction()
+
     async def commit(self, offsets: Mapping[TP, int], group_id: str) -> None:
         await self._producer.send_offsets_to_transaction(offsets, group_id)
+        await self._producer.commit_transaction()
+        await self._producer.start_transaction()
+
+    async def on_stop(self) -> None:
+        assert not self._producer._txn_manager.is_in_transaction()
+
+    def _settings_extra(self) -> Mapping[str, Any]:
+        return {
+            'enable_idempotence': True,
+            'acks': 'all',
+            'transactional_id': self.transaction_id,
+        }
 
 
 class Transport(base.Transport):

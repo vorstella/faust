@@ -175,7 +175,7 @@ class TransactionManagerT(ServiceT):
         ...
 
     @abc.abstractmethod
-    async def commit(self, offsets: Mapping[TP, int]) -> None:
+    async def commit(self, offsets: Mapping[TP, int]) -> bool:
         ...
 
 

@@ -62,6 +62,7 @@ from faust.types.app import AppT, BootStrategyT, TaskArg
 from faust.types.assignor import LeaderAssignorT, PartitionAssignorT
 from faust.types.codecs import CodecArg
 from faust.types.core import K, V
+from faust.types.enums import ProcessingGuarantee
 from faust.types.models import ModelArg
 from faust.types.router import RouterT
 from faust.types.serializers import RegistryT
@@ -1139,6 +1140,33 @@ class App(AppT, Service):
             key_serializer=key_serializer,
             value_serializer=value_serializer,
             callback=callback,
+        )
+
+    async def _send(self, topic: str,
+                    key: Optional[bytes], value: Optional[bytes],
+                    partition: int = None) -> Awaitable[RecordMetadata]:
+        if self.in_transaction:
+            return await self.consumer.transactions.send(
+                topic, key, value, partition)
+        else:
+            producer = await self.maybe_start_producer()
+            return await producer.send(topic, key, value, partition)
+
+    async def _send_and_wait(self, topic: str,
+                             key: Optional[bytes], value: Optional[bytes],
+                             partition: int = None) -> RecordMetadata:
+        if self.in_transaction:
+            return await self.consumer.transactions.send_and_wait(
+                topic, key, value, partition)
+        else:
+            producer = await self.maybe_start_producer()
+            return await producer.send_and_wait(topic, key, value, partition)
+
+    @cached_property
+    def in_transaction(self) -> bool:
+        return (
+            self.in_worker and
+            self.conf.processing_guarantee == ProcessingGuarantee.EXACTLY_ONCE
         )
 
     @stampede

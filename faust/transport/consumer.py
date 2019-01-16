@@ -212,7 +212,7 @@ class TransactionManager(Service, TransactionManagerT):
         p: int = self.consumer.key_partition(topic, key, partition)
         return await self._producers[p].send(topic, key, value, p)
 
-    async def commit(self, offsets: Mapping[TP, int]) -> None:
+    async def commit(self, offsets: Mapping[TP, int]) -> bool:
         producers = self._producers
         group_id = self.consumer.group_id
         group_by_partitions: MutableMapping[int, MutableMapping[TP, int]]
@@ -225,6 +225,7 @@ class TransactionManager(Service, TransactionManagerT):
             producers[partition].commit(partition_offsets, group_id)
             for partition, partition_offsets in group_by_partitions.items()
         ])
+        return True
 
     def key_partition(self, topic: str, key: bytes) -> TP:
         raise NotImplementedError()
@@ -748,13 +749,17 @@ class Consumer(Service, ConsumerT):
         if not commitable_offsets:
             return False
         with flight_recorder(self.log, timeout=300.0) as on_timeout:
+            did_commit = False
             on_timeout.info('+consumer.commit()')
-            await self._commit(commitable_offsets)
+            if self.app.in_transaction:
+                did_commit = await self.transactions.commit(commitable_offsets)
+            else:
+                did_commit = await self._commit(commitable_offsets)
             on_timeout.info('-consumer.commit()')
         self._committed_offset.update(commitable_offsets)
         self.app.monitor.on_tp_commit(commitable_offsets)
         self._last_batch = None
-        return True
+        return did_commit
 
     def _filter_tps_with_pending_acks(
             self, topics: TPorTopicSet = None) -> Iterator[TP]:
