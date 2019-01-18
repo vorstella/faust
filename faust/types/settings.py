@@ -155,7 +155,7 @@ BROKER_REQUEST_TIMEOUT = 40.0
 
 #: How often we commit acknowledged messages: every n messages.
 #: Used as the default value for :setting:`broker_commit_every`.
-BROKER_COMMIT_EVERY = 10_000
+BROKER_COMMIT_EVERY = 10
 
 #: How often we commit acknowledged messages on a timer.
 #: Used as the default value for :setting:`broker_commit_interval`.
